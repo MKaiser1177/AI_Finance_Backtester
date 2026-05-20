@@ -76,37 +76,53 @@ def download_data(tickers: list[str], start: str, end: str,
     """
     data   = {}
     failed = []
-    print(f"\n[Data] Loading {len(tickers)} tickers ({start} -> {end}) ...")
+    to_download = []
+    print(f"\n[Data] Checking local files and preparing download for {len(tickers)} tickers...")
 
     for tkr in tickers:
         csv_path = os.path.join(data_dir, f"{tkr}.csv")
-        try:
-            df = pd.read_csv(csv_path, index_col="Date", parse_dates=True)
-            df = df.loc[start:end]
-            if len(df) < 200:
-                failed.append(tkr)
-                continue
-            data[tkr] = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-            print(f"  OK  {tkr:20s}  {len(df):5d} days")
-        except FileNotFoundError:
-            # Try yfinance as fallback
+        if os.path.exists(csv_path):
             try:
-                import yfinance as yf
+                df = pd.read_csv(csv_path, index_col="Date", parse_dates=True)
+                df = df.loc[start:end]
+                if len(df) >= 200:
+                    data[tkr] = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                    continue
+            except Exception:
+                pass
+        to_download.append(tkr)
+
+    if to_download:
+        print(f"  [yfinance] Downloading {len(to_download)} missing tickers...")
+        try:
+            import yfinance as yf
+            yf_symbols = [t if t.endswith(".NS") else f"{t}.NS" for t in to_download]
+            # Grouping by ticker makes extraction more reliable for large sets
+            bulk_df = yf.download(yf_symbols, start=start, end=end, 
+                                 auto_adjust=True, progress=True, group_by='ticker')
+            
+            for tkr in to_download:
                 yf_sym = tkr if tkr.endswith(".NS") else f"{tkr}.NS"
-                df = yf.download(yf_sym, start=start, end=end,
-                                 auto_adjust=True, progress=False)
-                if df.empty or len(df) < 200:
-                    failed.append(tkr); continue
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                data[tkr] = df[["Open","High","Low","Close","Volume"]].copy()
-                print(f"  OK  {tkr:20s}  {len(df):5d} days  [yfinance]")
-            except Exception as exc:
-                print(f"  X  {tkr}: no CSV found and yfinance failed ({exc})")
-                failed.append(tkr)
-        except Exception as exc:
-            print(f"  X  {tkr}: {exc}")
-            failed.append(tkr)
+                try:
+                    # Extract individual ticker data from bulk result
+                    if len(yf_symbols) > 1:
+                        ticker_df = bulk_df[yf_sym]
+                    else:
+                        ticker_df = bulk_df
+                    
+                    ticker_df = ticker_df.dropna(subset=["Close"])
+                    if not ticker_df.empty:
+                        data[tkr] = ticker_df[["Open", "High", "Low", "Close", "Volume"]].copy()
+                        # Save to CSV for future local access
+                        os.makedirs(data_dir, exist_ok=True)
+                        data[tkr].to_csv(os.path.join(data_dir, f"{tkr}.csv"))
+                    else:
+                        failed.append(tkr)
+                except Exception:
+                    failed.append(tkr)
+        except Exception as e:
+            print(f"  X Bulk download failed: {e}")
+            failed.extend(to_download)
 
     if failed:
         print(f"\n[Warning] Could not load: {failed}")
@@ -391,6 +407,12 @@ def run_backtest(tickers: list[str], strategy: str, out_dir: str, data_dir: str 
     if not data:
         print("[Error] No data downloaded. Exiting.")
         return
+
+    # 1b. Consolidate closing prices (Requirement: 500 companies at once)
+    closes_df = pd.DataFrame({tkr: df["Close"] for tkr, df in data.items()})
+    consolidated_path = os.path.join(out_dir, "nifty500_all_closes.csv")
+    closes_df.to_csv(consolidated_path)
+    print(f"[Data] Consolidated daily closing prices (10 yrs) saved to: {consolidated_path}")
 
     # 2. Pre-compute momentum signals (needs all tickers)
     momentum_signals = {}
