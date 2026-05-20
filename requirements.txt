@@ -3,5 +3,4 @@ numpy>=1.24.0
 matplotlib>=3.7.0
 
 # Optional: only needed if you want to download real NSE data from Yahoo Finance.
-# The script works without it — just run generate_data.py first to create local CSVs.
-# yfinance>=0.2.0
+yfinance>=0.2.0

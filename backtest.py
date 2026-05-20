@@ -19,6 +19,7 @@ Usage:
 
 import argparse
 import os
+import urllib.request
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -111,6 +112,22 @@ def download_data(tickers: list[str], start: str, end: str,
         print(f"\n[Warning] Could not load: {failed}")
     print(f"[Data] Loaded {len(data)} tickers.\n")
     return data
+
+
+def get_nifty_500_tickers() -> list[str]:
+    """Fetch the latest Nifty 500 constituent list from NSE."""
+    url = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+    print(f"\n[Data] Fetching latest Nifty 500 list from NSE...")
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            df = pd.read_csv(response)
+            tickers = df['Symbol'].tolist()
+            print(f"  OK  Fetched {len(tickers)} tickers.")
+            return tickers
+    except Exception as e:
+        print(f"  X  Failed to fetch Nifty 500 list: {e}. Falling back to default list.")
+        return DEFAULT_TICKERS_NSE
 
 
 # ═══════════════════════════════════════════════════════
@@ -470,10 +487,16 @@ if __name__ == "__main__":
         "--data-dir", default="data",
         help="Directory with per-ticker CSV files (default: data)"
     )
+    parser.add_argument(
+        "--nifty500", action="store_true",
+        help="Fetch and use all 500 Nifty 500 tickers"
+    )
     args = parser.parse_args()
 
+    ticker_list = get_nifty_500_tickers() if args.nifty500 else args.tickers
+
     run_backtest(
-        tickers  = args.tickers,
+        tickers  = ticker_list,
         strategy = args.strategy,
         out_dir  = args.out,
         data_dir = args.data_dir,
