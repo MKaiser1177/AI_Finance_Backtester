@@ -1,6 +1,6 @@
 # Nifty 500 Backtesting Framework
 
-A Python-based backtesting framework for testing trading strategies on 50 representative stocks from the Nifty 500 index. This project includes data generation, strategy implementation, and detailed performance analysis with visualizations.
+A Python-based backtesting framework for testing trading strategies on 500 representative stocks from the Nifty 500 index. This project includes data generation, strategy implementation, and detailed performance analysis with visualizations.
 
 ## Overview
 
