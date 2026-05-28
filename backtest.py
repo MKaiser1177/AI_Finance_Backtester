@@ -32,6 +32,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from datetime import datetime, timedelta
+from dual_momentum_pf01 import run_pf01, compute_pf01_metrics, PF01Config, VARIANTS
+from pf01_data_loader import (
+    load_constituents_pti,
+    load_eligibility_flags,
+    load_liquidbees,
+    load_nifty500_tri,
+    load_rf_annual_series,
+    load_sector_map,
+)
 
 # ─────────────────────────────────────────────
 #  LOGGING CONFIGURATION
@@ -406,7 +415,18 @@ def plot_aggregate_equity(results: dict[str, pd.DataFrame], strategy_name: str, 
 #  MAIN ORCHESTRATOR
 # ═══════════════════════════════════════════════════════
 
-def run_backtest(tickers: list[str], strategy: str, out_dir: str, data_dir: str = "data"):
+def run_backtest(
+    tickers: list[str],
+    strategy: str,
+    out_dir: str,
+    data_dir: str = "data",
+    pf01_variant: str = "V5",
+    pf01_tc_roundtrip: float = 0.0032,
+    pf01_rf_annual: float = 0.06,
+    pf01_inputs_dir: str = "paper_inputs",
+    pf01_calibration_end: str = "2017-12-31",
+    pf01_run_all_variants: bool = False,
+):
     os.makedirs(out_dir, exist_ok=True)
 
     # 1. Download data
@@ -421,13 +441,114 @@ def run_backtest(tickers: list[str], strategy: str, out_dir: str, data_dir: str 
     closes_df.to_csv(consolidated_path)
     print(f"[Data] Consolidated daily closing prices (10 yrs) saved to: {consolidated_path}")
 
-    # 2. Pre-compute momentum signals (needs all tickers)
+    # 2. PF01 dual momentum path (portfolio-level, not per-ticker)
+    if strategy == "pf01":
+        print("[Strategy] Running PF01 dual momentum...")
+        sectors_fallback = {}
+        for group_name, group in [
+            ("IT", ["TCS", "INFY", "WIPRO", "TECHM", "HCLTECH", "MPHASIS"]),
+            ("Banking", ["HDFCBANK", "ICICIBANK", "KOTAKBANK", "AXISBANK", "SBIN", "INDUSINDBK", "BANDHANBNK"]),
+            ("NBFC", ["BAJFINANCE", "BAJAJFINSV", "HDFCAMC", "SBILIFE", "ICICIPRU"]),
+            ("Energy", ["RELIANCE", "ONGC", "BPCL", "POWERGRID", "NTPC"]),
+            ("FMCG", ["HINDUNILVR", "ITC", "NESTLEIND", "BRITANNIA", "DABUR"]),
+            ("Auto", ["MARUTI", "TATAMOTORS", "BAJAJ-AUTO", "HEROMOTOCO", "EICHERMOT"]),
+            ("Pharma", ["SUNPHARMA", "DRREDDY", "CIPLA", "DIVISLAB"]),
+            ("Consumer", ["TITAN", "ASIANPAINT", "PIDILITIND", "HAVELLS"]),
+            ("Telecom", ["BHARTIARTL"]),
+            ("Infra", ["LT", "ADANIPORTS", "SIEMENS", "ABB"]),
+            ("CementMetals", ["ULTRACEMCO", "AMBUJACEM", "JSWSTEEL", "TATASTEEL"]),
+        ]:
+            for ticker in group:
+                sectors_fallback[ticker] = group_name
+
+        nifty500_tri = load_nifty500_tri(pf01_inputs_dir)
+        rf_series = load_rf_annual_series(pf01_inputs_dir)
+        constituents_pti = load_constituents_pti(pf01_inputs_dir)
+        liquidbees = load_liquidbees(pf01_inputs_dir)
+        sectors_file = load_sector_map(pf01_inputs_dir)
+        eligibility_flags = load_eligibility_flags(pf01_inputs_dir)
+        sectors = sectors_file if sectors_file else sectors_fallback
+
+        if nifty500_tri is None:
+            print("[PF01] nifty500_tri.csv missing; using equal-weight close proxy.")
+            nifty500_tri = pd.DataFrame({t: df["Close"] for t, df in data.items()}).mean(axis=1)
+        if rf_series is None:
+            print("[PF01] rbi_91d_tbill.csv missing; using --rf-annual fallback.")
+        if constituents_pti is None:
+            print("[PF01] constituents_pti.csv missing; using all loaded tickers.")
+        if liquidbees is None:
+            print("[PF01] liquidbees.csv missing; using risk-free daily proxy for cash leg.")
+
+        variants_to_run = sorted(VARIANTS) if pf01_run_all_variants else [pf01_variant]
+        all_summary = []
+        split_summary = []
+
+        for v in variants_to_run:
+            cfg = PF01Config(variant=v, round_trip_cost=pf01_tc_roundtrip, rf_annual_default=pf01_rf_annual)
+            pf01_daily, pf01_metrics = run_pf01(
+                data=data,
+                variant=v,
+                nifty500_tri=nifty500_tri,
+                rf_annual_series=rf_series,
+                constituents_pti=constituents_pti,
+                sectors=sectors,
+                liquidbees_close=liquidbees,
+                eligibility_flags=eligibility_flags,
+                config=cfg,
+            )
+            daily_path = os.path.join(out_dir, f"pf01_{v}_equity.csv")
+            summary_path = os.path.join(out_dir, f"pf01_{v}_summary.csv")
+            pf01_daily.to_csv(daily_path)
+            pf01_metrics.to_csv(summary_path, index=False)
+            all_summary.append(pf01_metrics)
+
+            split_dt = pd.Timestamp(pf01_calibration_end)
+            cal = pf01_daily[pf01_daily.index <= split_dt]
+            hold = pf01_daily[pf01_daily.index > split_dt]
+            if len(cal) > 1:
+                m = compute_pf01_metrics(cal, pf01_rf_annual, v)
+                m.insert(1, "Window", "Calibration")
+                split_summary.append(m)
+            if len(hold) > 1:
+                m = compute_pf01_metrics(hold, pf01_rf_annual, v)
+                m.insert(1, "Window", "Holdout")
+                split_summary.append(m)
+
+        combined = pd.concat(all_summary, ignore_index=True).sort_values("Variant")
+        combined_path = os.path.join(out_dir, "pf01_variants_summary.csv")
+        combined.to_csv(combined_path, index=False)
+
+        if split_summary:
+            split_df = pd.concat(split_summary, ignore_index=True).sort_values(["Variant", "Window"])
+            split_path = os.path.join(out_dir, "pf01_calibration_holdout_summary.csv")
+            split_df.to_csv(split_path, index=False)
+        else:
+            split_df = None
+            split_path = None
+
+        print("\n" + "=" * 90)
+        print("  PF01 RESULTS")
+        print("=" * 90)
+        print(combined.to_string(index=False))
+        if split_df is not None:
+            print("\n" + "-" * 90)
+            print("  CALIBRATION / HOLDOUT")
+            print("-" * 90)
+            print(split_df.to_string(index=False))
+        print("=" * 90)
+        print(f"\n[Results] Combined summary: {combined_path}")
+        if split_path:
+            print(f"[Results] Split summary: {split_path}")
+        print(f"\n[Done] All outputs in: ./{out_dir}/")
+        return
+
+    # 3. Pre-compute momentum signals (needs all tickers)
     momentum_signals = {}
     if strategy == "momentum":
         print("[Strategy] Computing momentum signals (this may take a moment) ...")
         momentum_signals = strategy_momentum(data)
 
-    # 3. Run strategy per ticker
+    # 4. Run strategy per ticker
     results  = {}
     summaries = []
     STRATEGY_LABEL = {
@@ -505,7 +626,7 @@ if __name__ == "__main__":
         help="NSE ticker symbols (without .NS suffix)"
     )
     parser.add_argument(
-        "--strategy", choices=["sma", "rsi", "momentum"], default="sma",
+        "--strategy", choices=["sma", "rsi", "momentum", "pf01"], default="sma",
         help="Strategy to backtest (default: sma)"
     )
     parser.add_argument(
@@ -520,8 +641,31 @@ if __name__ == "__main__":
         "--nifty500", action="store_true",
         help="Fetch and use all 500 Nifty 500 tickers"
     )
+    parser.add_argument(
+        "--variant", choices=sorted(VARIANTS), default="V5",
+        help="PF01 variant for --strategy pf01 (default: V5)"
+    )
+    parser.add_argument(
+        "--tc-roundtrip", type=float, default=0.0032,
+        help="Round-trip transaction cost for PF01 (default: 0.0032 = 0.32%%)"
+    )
+    parser.add_argument(
+        "--rf-annual", type=float, default=0.06,
+        help="Fallback annual risk-free rate for PF01 if no RBI series is provided (default: 0.06)"
+    )
+    parser.add_argument(
+        "--pf01-inputs-dir", default="paper_inputs",
+        help="Directory containing PF01 paper input CSV files (default: paper_inputs)"
+    )
+    parser.add_argument(
+        "--pf01-calibration-end", default="2017-12-31",
+        help="Calibration window end date for split metrics (default: 2017-12-31)"
+    )
+    parser.add_argument(
+        "--pf01-run-all-variants", action="store_true",
+        help="Run all PF01 variants V0-V5 in one command"
+    )
     args = parser.parse_args()
-
     ticker_list = get_nifty_500_tickers() if args.nifty500 else args.tickers
 
     run_backtest(
@@ -529,4 +673,10 @@ if __name__ == "__main__":
         strategy = args.strategy,
         out_dir  = args.out,
         data_dir = args.data_dir,
+        pf01_variant=args.variant,
+        pf01_tc_roundtrip=args.tc_roundtrip,
+        pf01_rf_annual=args.rf_annual,
+        pf01_inputs_dir=args.pf01_inputs_dir,
+        pf01_calibration_end=args.pf01_calibration_end,
+        pf01_run_all_variants=args.pf01_run_all_variants,
     )
