@@ -125,24 +125,21 @@ def download_data(tickers: List[str], start: str, end: str,
                         ticker_df = bulk_df[yf_sym]
                     else:
                         ticker_df = bulk_df
-                    
+                except KeyError:
+                    print(f"  X  Ticker {tkr} not found in yfinance response.")
+                    failed.append(tkr)
+                    continue    
                     ticker_df = ticker_df.dropna(subset=["Close"])
                     if not ticker_df.empty:
                         data[tkr] = ticker_df[["Open", "High", "Low", "Close", "Volume"]].copy()
                         # Save to CSV for future local access
                         os.makedirs(data_dir, exist_ok=True)
-                        data[tkr].to_csv(os.path.join(data_dir, f"{tkr}.csv"))
+                        ticker_df.to_csv(os.path.join(data_dir, f"{tkr}.csv"))
                     else:
                         failed.append(tkr)
-                except Exception:
-                    failed.append(tkr)
         except Exception as e:
-            print(f"  X Bulk download failed: {e}")
-            failed.extend(to_download)
+            print(f"  X  Failed to download data for tickers: {', '.join(to_download)}: {str(e)}")
 
-    if failed:
-        print(f"\n[Warning] Could not load: {failed}")
-    print(f"[Data] Loaded {len(data)} tickers.\n")
     return data
 
 
